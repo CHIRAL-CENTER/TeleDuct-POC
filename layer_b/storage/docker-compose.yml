@@ -1,0 +1,13 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: research-postgres
+    environment:
+      POSTGRES_USER: researcher
+      POSTGRES_PASSWORD: hackathon2026
+      POSTGRES_DB: agent_observability
+    ports:
+      - "5433:5432"
+    volumes:
+      - ~/.pgdata_hackathon:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
