@@ -10,8 +10,9 @@ from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
 from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
 from opentelemetry.sdk.resources import Resource
 
+
 class DualWriteEmitter:
-    def __init__(self, signoz_endpoint, pg_dsn,
+    def __init__(self, signoz_endpoint, pg_dsn=None,
                  service_name="teleduct-sglang"):
 
         # ── SigNoz (traces + metrics) ──
@@ -41,9 +42,21 @@ class DualWriteEmitter:
         self.m_queue   = meter.create_gauge("sglang.queue_depth")
 
         # ── PostgreSQL (Ally's ASUS, reached via ngrok) ──
-        self.pg  = psycopg2.connect(pg_dsn)
-        self.pg.autocommit = True
-        self.cur = self.pg.cursor()
+        # Now OPTIONAL — SigNoz keeps working even if PostgreSQL
+        # isn't reachable yet. Pass pg_dsn=None to skip it entirely.
+        self.pg_enabled = False
+        if pg_dsn:
+            try:
+                self.pg = psycopg2.connect(pg_dsn, connect_timeout=5)
+                self.pg.autocommit = True
+                self.cur = self.pg.cursor()
+                self.pg_enabled = True
+                print("✅ PostgreSQL connected")
+            except Exception as e:
+                print(f"⚠️ PostgreSQL not reachable ({e}) — continuing with SigNoz only")
+                self.pg_enabled = False
+        else:
+            print("⚠️ No PostgreSQL DSN provided — SigNoz-only mode")
 
     def emit_logit_event(self, d):
         with self.tracer.start_as_current_span("logit_capture") as s:
@@ -56,14 +69,19 @@ class DualWriteEmitter:
                              {"node": str(d.get("node_name"))})
         if d["fragility_flag"]:
             self.m_fragile.add(1)
-        self.cur.execute("""INSERT INTO logit_telemetry
-            (session_id, step_id, request_id, timestamp_ns, top_k_token_ids,
-             top_k_probs, sampling_margin, fragility_flag, confidence_label)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
-            (d.get("session_id"), d.get("step_id"), d.get("request_id"),
-             d["timestamp_ns"], Json(d["top_k_token_ids"]),
-             Json(d["top_k_probs"]), d["sampling_margin"],
-             d["fragility_flag"], d["confidence_label"]))
+
+        if self.pg_enabled:
+            try:
+                self.cur.execute("""INSERT INTO logit_telemetry
+                    (session_id, step_id, request_id, timestamp_ns, top_k_token_ids,
+                     top_k_probs, sampling_margin, fragility_flag, confidence_label)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                    (d.get("session_id"), d.get("step_id"), d.get("request_id"),
+                     d["timestamp_ns"], Json(d["top_k_token_ids"]),
+                     Json(d["top_k_probs"]), d["sampling_margin"],
+                     d["fragility_flag"], d["confidence_label"]))
+            except Exception as e:
+                print(f"⚠️ PostgreSQL write failed (logit_event): {e}")
 
     def emit_moe_event(self, d):
         with self.tracer.start_as_current_span("moe_routing") as s:
@@ -73,14 +91,19 @@ class DualWriteEmitter:
             s.set_attribute("moe.expert_load",        json.dumps(d["expert_load"]))
         self.m_moe.record(d["avg_routing_margin"],
                           {"layer": str(d["layer_idx"])})
-        self.cur.execute("""INSERT INTO moe_telemetry
-            (session_id, step_id, timestamp_ns, layer_idx, num_experts_total,
-             experts_per_token, avg_routing_margin, routing_fragile, expert_load)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
-            (d.get("session_id"), d.get("step_id"), d["timestamp_ns"],
-             d["layer_idx"], d["num_experts_total"], d["experts_per_token"],
-             d["avg_routing_margin"], d["routing_fragile"],
-             Json(d["expert_load"])))
+
+        if self.pg_enabled:
+            try:
+                self.cur.execute("""INSERT INTO moe_telemetry
+                    (session_id, step_id, timestamp_ns, layer_idx, num_experts_total,
+                     experts_per_token, avg_routing_margin, routing_fragile, expert_load)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                    (d.get("session_id"), d.get("step_id"), d["timestamp_ns"],
+                     d["layer_idx"], d["num_experts_total"], d["experts_per_token"],
+                     d["avg_routing_margin"], d["routing_fragile"],
+                     Json(d["expert_load"])))
+            except Exception as e:
+                print(f"⚠️ PostgreSQL write failed (moe_event): {e}")
 
     def emit_hardware_event(self, d):
         with self.tracer.start_as_current_span("gpu_hardware_state") as s:
@@ -89,22 +112,32 @@ class DualWriteEmitter:
         self.m_vram.set(d["gpu_vram_used_gb"])
         self.m_sm.set(d["gpu_sm_utilization"])
         self.m_power.set(d["gpu_power_watts"])
-        self.cur.execute("""INSERT INTO hardware_telemetry
-            (timestamp_ns, gpu_vram_used_gb, gpu_vram_pressure,
-             gpu_sm_utilization, gpu_memory_bandwidth,
-             gpu_temperature_c, gpu_power_watts)
-            VALUES (%s,%s,%s,%s,%s,%s,%s)""",
-            (d["timestamp_ns"], d["gpu_vram_used_gb"], d["gpu_vram_pressure"],
-             d["gpu_sm_utilization"], d["gpu_memory_bandwidth"],
-             d["gpu_temperature_c"], d["gpu_power_watts"]))
+
+        if self.pg_enabled:
+            try:
+                self.cur.execute("""INSERT INTO hardware_telemetry
+                    (timestamp_ns, gpu_vram_used_gb, gpu_vram_pressure,
+                     gpu_sm_utilization, gpu_memory_bandwidth,
+                     gpu_temperature_c, gpu_power_watts)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s)""",
+                    (d["timestamp_ns"], d["gpu_vram_used_gb"], d["gpu_vram_pressure"],
+                     d["gpu_sm_utilization"], d["gpu_memory_bandwidth"],
+                     d["gpu_temperature_c"], d["gpu_power_watts"]))
+            except Exception as e:
+                print(f"⚠️ PostgreSQL write failed (hardware_event): {e}")
 
     def emit_sglang_metrics(self, d):
         self.m_ttft.set(d["ttft_ms"])
         self.m_tps.set(d["tokens_per_sec"])
         self.m_queue.set(d["queue_depth"])
-        self.cur.execute("""INSERT INTO sglang_metrics
-            (timestamp_ns, ttft_ms, tokens_per_sec, queue_depth,
-             kv_cache_usage, running_requests)
-            VALUES (%s,%s,%s,%s,%s,%s)""",
-            (d["timestamp_ns"], d["ttft_ms"], d["tokens_per_sec"],
-             d["queue_depth"], d["kv_cache_usage"], d["running_requests"]))
+
+        if self.pg_enabled:
+            try:
+                self.cur.execute("""INSERT INTO sglang_metrics
+                    (timestamp_ns, ttft_ms, tokens_per_sec, queue_depth,
+                     kv_cache_usage, running_requests)
+                    VALUES (%s,%s,%s,%s,%s,%s)""",
+                    (d["timestamp_ns"], d["ttft_ms"], d["tokens_per_sec"],
+                     d["queue_depth"], d["kv_cache_usage"], d["running_requests"]))
+            except Exception as e:
+                print(f"⚠️ PostgreSQL write failed (sglang_metrics): {e}")
