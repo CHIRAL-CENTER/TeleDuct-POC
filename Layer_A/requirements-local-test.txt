@@ -1,0 +1,10 @@
+# layer_a/requirements-local-test.txt
+# CPU-only, for LOCAL testing on your Mac before GPU deployment.
+# The GPU instance will use the pinned cu130 versions instead —
+# do NOT use this file on the rented instance.
+torch
+pynvml
+requests
+opentelemetry-sdk
+opentelemetry-exporter-otlp-proto-http
+psycopg2-binary

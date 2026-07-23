@@ -1,0 +1,4 @@
+# layer_b/requirements.txt
+psycopg2-binary
+langgraph
+langchain-core
